@@ -1,0 +1,174 @@
+name: JMeter Grupo 09 - Reportes y Dashboard (informe PDF + Grafana)
+
+on:
+  # Corre solo cuando cambia el plan del grupo 09 (o este workflow) en una rama grupo-09-*.
+  push:
+    branches: ["grupo-09-*"]
+    paths:
+      - "tests/performance/plans/P_GRUPO_09_REPORTES_CSV.jmx"
+      - "tests/performance/data/D_GRUPO_09_REPORTES_CSV.csv"
+      - "tests/performance/properties/GRUPO_09_REPORTES_CSV.properties"
+      - "tests/performance/thresholds/GRUPO_09_REPORTES.json"
+      - ".github/workflows/jmeter-grupo09-fabri-performance.yml"
+  # Ejecucion manual (solo aparece en la pestaña Actions si el workflow esta en la rama por defecto).
+  workflow_dispatch:
+    inputs:
+      monitoring_dashboard_url:
+        description: >-
+          URL publica de un dashboard de monitoreo (Grafana) a capturar como evidencia
+          post-ejecucion. Si se deja vacio se usa el dashboard del curso.
+        required: false
+        default: https://purplespinach239.grafana.net/public-dashboards/ce95c3fa413048d3a79d3c6fc60de958
+      delay_ms:
+        description: "Pausa entre pedidos en ms (rate limit de la API: 30 req/min por key)"
+        required: false
+        default: "2500"
+
+permissions:
+  contents: read
+
+env:
+  JMETER_VERSION: 5.6.3
+  RESULTS_DIR: test-results/performance
+  PLAN: tests/performance/plans/P_GRUPO_09_REPORTES_CSV.jmx
+  PROPS: tests/performance/properties/GRUPO_09_REPORTES_CSV.properties
+  THRESHOLDS: tests/performance/thresholds/GRUPO_09_REPORTES.json
+  # En push no hay inputs: se usa el dashboard del curso por defecto.
+  MONITORING_URL: ${{ inputs.monitoring_dashboard_url || 'https://purplespinach239.grafana.net/public-dashboards/ce95c3fa413048d3a79d3c6fc60de958' }}
+
+jobs:
+  performance:
+    name: JMeter + Grafana + informe PDF
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout del repositorio
+        uses: actions/checkout@v7
+
+      - name: Verificar secreto de la API
+        # La API key nunca va en el repo: se guarda como secreto del repositorio.
+        env:
+          API_KEY: ${{ secrets.GRUPO09_API_KEY }}
+        run: |
+          if [ -z "${API_KEY}" ]; then
+            echo "::error::Falta el secreto GRUPO09_API_KEY (Settings > Secrets and variables > Actions > New repository secret)."
+            exit 1
+          fi
+
+      - name: Configurar Java (requerido por JMeter)
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22
+
+      - name: Instalar JMeter
+        run: |
+          curl --fail --location --silent --show-error \
+            "https://archive.apache.org/dist/jmeter/binaries/apache-jmeter-${JMETER_VERSION}.tgz" -o jmeter.tgz
+          tar -xzf jmeter.tgz
+
+      - name: Ejecutar plan de pruebas headless
+        # El plan lee la API key de la variable de entorno API_KEY (nunca por -J).
+        # El -q carga las properties que apagan los reintentos automaticos del POST.
+        env:
+          API_KEY: ${{ secrets.GRUPO09_API_KEY }}
+        run: |
+          mkdir -p "${RESULTS_DIR}/dashboard"
+          "apache-jmeter-${JMETER_VERSION}/bin/jmeter" -n \
+            -t "${PLAN}" \
+            -q "${PROPS}" \
+            -l "${RESULTS_DIR}/R_GRUPO_09_REPORTES_CSV.jtl" \
+            -e -o "${RESULTS_DIR}/dashboard" \
+            -JrunId="ci-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            -JdelayMs="${{ inputs.delay_ms || '2500' }}"
+
+      - name: Diagnostico del JTL (cabecera y primeras filas)
+        if: always()
+        run: |
+          echo "--- primeras 3 lineas del JTL ---"
+          head -n 3 "${RESULTS_DIR}/R_GRUPO_09_REPORTES_CSV.jtl" || true
+          echo "--- total de muestras ---"
+          tail -n +2 "${RESULTS_DIR}/R_GRUPO_09_REPORTES_CSV.jtl" | wc -l || true
+
+      - name: Configurar Python (captura de monitoreo)
+        if: always()
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Capturar evidencia del dashboard de Grafana
+        # Chrome viene preinstalado en ubuntu-latest y Selenium Manager resuelve el driver.
+        # La espera larga cubre el arranque en frio de un stack de Grafana Cloud.
+        # Una captura fallida no debe impedir el informe, por eso continue-on-error.
+        if: always()
+        continue-on-error: true
+        run: |
+          pip install selenium
+          mkdir -p "${RESULTS_DIR}/evidence"
+          CAPTURE=$(npm pack aiquaa-performance-mcp-server --pack-destination . --silent)
+          tar -xzf "$CAPTURE" package/dist/monitoring/python/capture_dashboard.py
+          python3 package/dist/monitoring/python/capture_dashboard.py \
+            --url "${MONITORING_URL}" \
+            --output "${RESULTS_DIR}/evidence/EVIDENCIA_MONITOREO.png" \
+            --wait-seconds 8 \
+            --timeout-seconds 180
+
+      - name: Generar informe PDF
+        if: always()
+        run: |
+          EVIDENCE_ARGS=()
+          if [ -f "${RESULTS_DIR}/evidence/EVIDENCIA_MONITOREO.png" ]; then
+            EVIDENCE_ARGS=(--evidence-image "${RESULTS_DIR}/evidence/EVIDENCIA_MONITOREO.png" \
+              --evidence-label "Dashboard de monitoreo (Grafana)" \
+              --evidence-url "${MONITORING_URL}")
+          fi
+          # El generador sale con codigo 1 si el veredicto es FAIL. Aca solo interesa producir
+          # el PDF; el gate del SLA es el paso "Evaluar umbrales".
+          set +e
+          npx -y aiquaa-performance-mcp-server --report \
+            "${RESULTS_DIR}/R_GRUPO_09_REPORTES_CSV.jtl" \
+            "${THRESHOLDS}" \
+            "${RESULTS_DIR}/INFORME_PERF_GRUPO_09.pdf" \
+            --api-name "AIQUAA Sandbox API (movimientos / reportes)" \
+            --plan "${PLAN}" \
+            --test-type carga \
+            --threads 1 \
+            --loops 8 \
+            --author "${{ github.triggering_actor }}" \
+            --api-version "${{ github.sha }}" \
+            --repo-url "${{ github.server_url }}/${{ github.repository }}" \
+            "${EVIDENCE_ARGS[@]}"
+          status=$?
+          set -e
+          if [ ! -f "${RESULTS_DIR}/INFORME_PERF_GRUPO_09.pdf" ]; then
+            echo "::error::No se genero el informe PDF (exit ${status})."
+            exit "${status}"
+          fi
+
+      - name: Evaluar umbrales (SLA)
+        # Corre despues del informe para que el PDF se publique aun si el SLA falla.
+        run: |
+          npx -y aiquaa-performance-mcp-server --evaluate \
+            "${RESULTS_DIR}/R_GRUPO_09_REPORTES_CSV.jtl" \
+            "${THRESHOLDS}"
+
+      - name: Subir informe PDF (se abre directo en el navegador)
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          path: test-results/performance/INFORME_PERF_GRUPO_09.pdf
+          archive: false
+          if-no-files-found: warn
+
+      - name: Subir resultados completos
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: jmeter-grupo09
+          path: test-results/performance
+          retention-days: 7
